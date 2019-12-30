@@ -1,0 +1,233 @@
+##############################################################
+# Copyright (c) 2015-2019 Datrium, Inc. All rights reserved. #
+#                -- Datrium Confidential --                  #
+##############################################################
+
+'''
+DeployVM
+--------
+
+This workload will deploy a VM to vsphere instance (either a VC, a standalone ESX,
+or a particular ESX within a VC).  The user may specify the VM name (--vmname),
+whether or not to power on the VM after deployment (--poweron), etc. The user must
+specify a --vc (this can be any entity that accepts vim apis -- namely a VC instance,
+or a standalone ESX host).
+
+:Example:
+
+workloads.py -v execute DeployVM --ovf /auto/home/shared/ovfs/vdbtemplate/vdbtemplate.ovf
+--vc b3tc1-pesx01
+
+workloads.py -v execute DeployVM --ovf /auto/home/shared/ovfs/vdbtemplate/vdbtemplate.ovf
+--vc b3tc1-vca --host b3tc1-pesx02
+
+workloads.py -v execute DeployVM --ovf /auto/home/shared/ovfs/vdbtemplate/vdbtemplate.ovf
+--vc b20-vca --vmname somethingnew --poweron
+
+
+.. autoclass:: DeployVM()
+   :members:
+   :private-members:
+
+'''
+
+import logging
+import threading
+
+import base
+import CreateDisk
+import dalibs.retry as retry
+import hosts
+import PowerOnVM
+import syspath
+import vim
+
+# TEMPLATES are the different OVFs
+# TODO: add hq locations of ovfs
+TEMPLATES = {
+    'centos7': '/net/FS-04/tank0/build/workloads/ovf/centos7_vdb_U4/centos7_vdb_U4.ovf',
+    # vm hostname modified from localhost.localdomain to localhost
+    'centos7_irr': '/net/FS-04/tank0/build/workloads/ovf/centos7_irr/centos7_irr.ovf',
+    'smallCentos7': '/net/FS-04/tank0/build/workloads/ovf/smallCentos7_vdb_U4/smallCentos7.ovf',
+    'centos65': '/net/FS-04/tank0/build/workloads/ovf/centos65_vdb_U4/centos65_vdb_U4.ovf',
+    'lubuntu': '/net/FS-04/tank0/build/workloads/ovf/lubuntu_vdb_U1/lubuntu_vdb_U1.ovf',
+    'small_vdb': '/net/FS-04/tank0/build/workloads/ovf/small-vdbench-1/small-vdbench-1.ovf',
+    'windows': '/net/FS-04/tank0/build/workloads/ovf/win7_vdbench_u2/win7_vdbench_u2.ovf',
+    'windows7' : '/net/FS-04/tank0/build/workloads/ovf/win7_gfr/win7_gfr.ovf',
+    'windows8' : '/net/FS-04/tank0/build/workloads/ovf/win8_gfr/win8_GFR.ovf',
+    'windows10': '/net/FS-04/tank0/build/workloads/ovf/win10_gfr/win10.ovf',
+    'windows2008R2': '/net/FS-04/tank0/build/workloads/ovf/win2008r2_gfr/win2008r2.ovf',
+    'windows2008R2_vss': '/net/FS-04/tank0/build/workloads/ovf/w2k8mini_base_cygwin/w2k8mini_base_cygwin.ovf',
+    'windows2008R2_vss_TLS10': '/net/FS-04/tank0/build/workloads/ovf/w2k8mini_base_cygwin/w2k8mini_base_cygwin-TLS10.ovf',
+    'windows2012R2' : '/net/FS-04/tank0/build/workloads/ovf/win2012r2_gfr/win2012r2_gfr.ovf',
+    'windows2012R2_noipv6': '/net/fs-04/tank0/build/workloads/ovf/win2012r2/win2012r2.ovf',
+    # Used for Jenkins running of IRR Windows tests
+    'windows2012R2_staticip': '/net/fs-04/tank0/build/workloads/ovf/win2012r2_staticip_dec4/vm-static-ip-zero-reserved-mem.ovf',
+    # Used for automation development of IRR Windows tests
+    'windows2012R2_staticip_auto_dev': '/net/FS-04/tank0/build/workloads/ovf/win2012r2_staticip_automation/win2012r2_for_auto.ovf',
+    'linux_gfr' : '/net/FS-04/tank0/build/workloads/ovf/linux_gfr/linux_gfr.ovf',
+    'windows2016' : '/net/FS-04/tank0/build/workloads/ovf/win2016_gfr/win2016.ovf',
+    'windows2016_irr' : '/net/FS-04/tank0/build/workloads/ovf/windows2016/windows2016.ovf',
+    'windows2016_nic2' : '/net/FS-04/tank0/build/workloads/ovf/windows2016_nic2/windows2016_nic2.ovf',
+    'windows_10_irr' : '/net/FS-04/tank0/build/workloads/ovf/win10_irr_noapps/win10-fresh-noapps.ovf',
+    'windows_10_staticip': '/net/FS-04/tank0/build/workloads/ovf/win10_staticip/windows10_staticip.ovf',
+    'fio': '/auto/home/shared/ovfs/perfdev-fio-template2/perfdev-fio-template1.ovf',
+    'tiny-stress': '/auto/home/shared/ovfs/tiny-stress/tiny-stress.ovf',
+    'tiny-core': '/auto/home/shared/ovfs/tiny-core/yVM/yVM.ovf',
+    'tiny-core-scsi': '/auto/home/shared/ovfs/tiny-core-scsi/tiny-core-scsi.ovf',
+    'win2012-sql': '/net/FS-04/tank0/build/workloads/ovf/win2012-sql2012/win2012-sqlserver2012.ovf',
+    'win2016-sql2016': '/net/FS-04/tank0/build/workloads/ovf/win2016-sql2016/win2016-sql2016.ovf',
+    'win2019-sql2016':'/net/fs-04/tank0/build/workloads/ovf/win2019-sql2016/win2019-sql2016.ovf',
+    'win2016-sql2017':'/net/fs-04/tank0/build/workloads/ovf/win2016-sql2017/win2016-sql2017.ovf',
+    'win2012-exch': '/net/FS-04/tank0/build/workloads/ovf/vss-exch/vss-exch.ovf',
+    'win2012R2-exch2013': '/net/FS-04/tank0/build/workloads/ovf/vss-exch/vss-exch.ovf',
+    'win2016-exch2016-cu14': '/net/fs-04/tank0/build/workloads/ovf/exchange/exchange2016.ovf',
+    'win2019-exch2019' : '/net/fs-04/tank0/build/workloads/ovf/exchange/exchange2019.ovf',
+    'kubernetes': '/net/FS-04/tank0/build/workloads/ovf/_daCentOS7_2017061900_k8s1142/_daCentOS7_2017061900_k8s1142.ovf',
+    }
+
+class DeployVMEvents(base.Events):
+    DEPLOYING = 'DEPLOYING'
+    DEPLOYED = 'DEPLOYED'
+
+class DeployVM(base.Workload):
+    lock = threading.Lock()
+    instance = 0
+    _default_timeout = 3600
+    # all other workloads this workload depends on
+    _depends_on = [CreateDisk.CreateDisk]
+
+    def __init__(self, **kwargs):
+        super(DeployVM, self).__init__(**kwargs)
+        self.events = DeployVMEvents()
+        self.events.merge_events(PowerOnVM.PowerOnVMEvents())
+        self.events.merge_events(CreateDisk.CreateDiskEvents())
+        if self.ovf in TEMPLATES:
+            self.ovf = TEMPLATES[self.ovf]
+        self.vcobj = vim.VC(self.vc, username=self.vc_username, password=self.vc_password)
+        self.datastore = None
+        if self.datastore_label:
+            datastores = self.vcobj.find(vim.Datastore)
+            logging.debug('datastores: %s' % [x.name for x in datastores])
+            for d in datastores:
+                if d.name == self.datastore_label:
+                    self.datastore = d
+                    break
+            else:
+                raise Exception('Unable to find datastore with label %s' % self.datastore_label)
+        self.vm = None  # also used to export the vm to downstream workloads
+        if self.add_disks is not None:
+            self.add_disks = {'number': self.add_disks[0], 'size': self.add_disks[1]}
+        elif 'centos' in self.ovf:
+            # Limit disk size to 1/2 freespace when not specified.
+            default = 1000
+            maxsize = min(default, (self.datastore.info.freeSpace/(1000*1000*1000))/2)
+            if maxsize < default:
+                logging.warn('add_disk size limit %d GB due to limited datastore freespace' % maxsize)
+            # Add 1 extra disk for centos
+            self.add_disks = {'number': 1, 'size': maxsize}
+
+    @classmethod
+    def _add_arguments(cls, parser):
+        group = parser.add_argument_group(cls.__name__)
+        group.add_argument('--vmname', help='Name of the deployed VM')
+        group.add_argument('--basename', default='testvm', help='Basename of VM')
+        group.add_argument('--bootcmd', help='Boot command')
+        group.add_argument('--host', help='ESX host to deploy onto')
+        group.add_argument('--datastore_label', help='datastore name/label to deploy on')
+        group.add_argument('--network', default='VM Network',
+                           help='Network name for vnic (name as string)')
+        group.add_argument('--ovf', help='Path to OVF file')
+        group.add_argument('--vc', help='the vcenter (or esx) to connect to')
+        group.add_argument('--vc_username', help='the vcenter username')
+        group.add_argument('--vc_password', help='the vcenter password')
+        group.add_argument('--poweron', help='Power up VM after deployment', action='store_true')
+        group.add_argument('--add_disks', default=None, help='Specify number of disks per host and size in GB', nargs=2,
+                           type=int)
+
+    def _execute(self, **kwargs):
+        self.status = base.Status.UNKNOWN
+        self.state = base.State.UNKNOWN
+        params = {}
+        vm = self.vcobj.vm(self.vmname)
+        if vm is not None:
+            raise Exception('A VM with name %s already exists' % self.vmname)
+
+        host = self.host
+        if host is not None:
+            __hosts = self.vcobj.find(vim.HostSystem)
+            logging.debug('hosts: %s' % [x.name for x in __hosts])
+            for x in __hosts:
+                if hosts.hostname(x.name) == hosts.hostname(self.host):
+                    host = x
+                    break
+            else:
+                raise Exception('Unable to find host named %s' % self.host)
+            assert self.datastore in host.datastore, (
+                '%s is not associated with %s' % (self.datastore.name, host.name))
+            params['cluster'] = host.parent
+
+        if self.vmname is None:
+            with self.lock:
+                self.vmname = '%s_%d' % (self.basename, DeployVM.instance)
+                DeployVM.instance += 1
+
+        self.events.append(self.events.DEPLOYING)
+        params['name'] = self.vmname
+        params['datastore'] = self.datastore
+        params['datacenter'] = self.datastore.parent.parent
+        params['network'] = self.network
+        if host is not None:
+            params['host'] = host
+        self.vcobj.importovf(self.ovf, **params)
+        for _ in retry.retry(timeout=self.timeleft, raises=False):
+            self.vm = self.vcobj.vm(self.vmname)
+            if self.vm is not None:
+                break
+        err_msg = 'Timeout on deploying vm %s' % self.vmname
+        assert (self.vm is not None), err_msg
+        err_msg = 'After importing ovf, unexpected name %s != %s' % (self.vm.name, self.vmname)
+        assert (self.vm.name == self.vmname), err_msg
+
+        if self.add_disks is not None:
+            busNumber = 0
+            for d in xrange(self.add_disks['number']):
+                if len(self.vm.disks) % 15 == 0:
+                    t = self.vm.AddDevices_Task({'scsi': 'no'})
+                    t.wait()
+                    busNumber += 1
+                t = self.vm.AddDisk_Task(gbytes=self.add_disks['size'], busNumber=busNumber)
+                t.wait()
+        if self.bootcmd is not None:
+            option = vim.option.OptionValue()
+            option.key = 'machine.id'
+            option.value = self.bootcmd
+            config = vim.vm.ConfigSpec()
+            config.extraConfig = [option]
+            self.vm.ReconfigVM_Task(config).wait()
+        note = self.vm.getnote()
+        if not isinstance(note, dict):
+            original = note
+            note = {}
+            note['original'] = original
+        note['ovf'] = self.ovf
+        self.vm.setnote(note)
+        self.vm.touch()
+        self.events.append(self.events.DEPLOYED)
+
+        if self.disks:
+            wl = CreateDisk.CreateDisk(**self.kwargs)
+            self.events.append(self.events.CREATINGDISK)
+            wl.execute()
+            wl.wait()
+            self.events.append(self.events.CREATEDDISK)
+
+        if self.poweron:
+            wl = PowerOnVM.PowerOnVM(**self.kwargs)
+            self.events.append(self.events.POWERINGON)
+            wl.execute()
+            wl.wait()
+            self.events.append(self.events.POWEREDON)
+
+        self.status = base.Status.PASS
+        self.state = base.State.COMPLETE
